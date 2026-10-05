@@ -186,6 +186,174 @@ test('HTTP_4XX retry budget is shared across matching status codes', { concurren
   })
 })
 
+/**
+ * 按 dsh 会话加载器（@deepseek-ai/dsh-llm-retry invariant）的规则校验事件流：
+ * 1. 同一条策略链（turn+step+provider+policyKey）内 retryId 恒定；
+ * 2. 链内 retry 从 1 连续递增且不超过 maxRetries；
+ * 3. retryId 不得跨链重复；
+ * 4. llm/retry-started 与已排程 (retryId, retry) 一一配对。
+ * 回归 v0.3.0 缺陷：预算计数被误用作链内序号，重启后会话历史整体无法加载。
+ */
+function assertRetryChainInvariants(agent) {
+  const retries = agent.events.filter((event) => event.type === 'llm/retry')
+  const chainLast = new Map()
+  const chainOwner = new Map()
+  for (const event of retries) {
+    const { retryId, turn, step, provider, policyKey, retry, maxRetries } = event.data
+    const chain = `${turn}:${step}:${provider}:${policyKey}`
+    const last = chainLast.get(chain)
+    if (last === undefined) {
+      assert.equal(retry, 1, `chain ${chain} must start its attempt sequence at 1`)
+      assert.equal(chainOwner.has(retryId), false, `retryId ${retryId} is owned by another chain`)
+      chainOwner.set(retryId, chain)
+    } else {
+      assert.equal(retryId, last.retryId, `chain ${chain} must keep one retryId`)
+      assert.equal(retry, last.retry + 1, `chain ${chain} must count attempts consecutively`)
+    }
+    assert.ok(retry <= maxRetries, `retry ${retry} must not exceed maxRetries ${maxRetries}`)
+    chainLast.set(chain, { retryId, retry })
+  }
+  const scheduled = new Set(retries.map((event) => `${event.data.retryId}#${event.data.retry}`))
+  const startedSeen = new Set()
+  for (const event of agent.events.filter((item) => item.type === 'llm/retry-started')) {
+    const key = `${event.data.retryId}#${event.data.retry}`
+    assert.ok(scheduled.has(key), `retry-started ${key} pairs no scheduled attempt`)
+    assert.equal(startedSeen.has(key), false, `retry-started repeats ${key}`)
+    startedSeen.add(key)
+  }
+}
+
+/** Build a request-error invocation against one agent with fixed turn/step/provider. */
+function sendSupplementalFailure(fixture, agent, { turn, step, provider = 'mock', code, message }, signal) {
+  const handler = fixture.listeners.get('agent/request-error')[0]
+  return handler({ agent, turn, step, provider, failure: { code, message }, signal }, async () => undefined)
+}
+
+test('supplemental retries keep one retryId and consecutive attempts per policy chain', { concurrency: false }, async () => {
+  await withFakeTimers(async () => {
+    const fixture = createFixture({
+      rules: [{ code: 'SERVER', enabled: true, maxRetries: 2 }],
+    })
+    try {
+      const agent = createAgent('session-abcdef12-chain', {}, fixture.eventStore)
+      const signal = new AbortController().signal
+
+      const first = sendSupplementalFailure(fixture, agent, { turn: 7, step: 84, code: 'SERVER', message: '502' }, signal)
+      await Promise.resolve()
+      mock.timers.tick(200)
+      assert.deepEqual(await first, { kind: 'retry' })
+      const second = sendSupplementalFailure(fixture, agent, { turn: 7, step: 84, code: 'SERVER', message: '502' }, signal)
+      await Promise.resolve()
+      mock.timers.tick(200)
+      assert.deepEqual(await second, { kind: 'retry' })
+
+      const retries = agent.events.filter((event) => event.type === 'llm/retry')
+      assert.equal(retries.length, 2)
+      assert.equal(retries[0].data.retryId, retries[1].data.retryId)
+      assert.deepEqual(retries.map((event) => event.data.retry), [1, 2])
+      assertRetryChainInvariants(agent)
+    } finally {
+      await fixture.dispose()
+    }
+  })
+})
+
+test('retry attempts restart at 1 for each new step despite a shared budget', { concurrency: false }, async () => {
+  await withFakeTimers(async () => {
+    const fixture = createFixture({
+      rules: [{ code: 'SERVER', enabled: true, maxRetries: 2 }],
+    })
+    try {
+      const agent = createAgent('session-abcdef12-step', {}, fixture.eventStore)
+      const signal = new AbortController().signal
+
+      const firstStep = sendSupplementalFailure(fixture, agent, { turn: 1, step: 1, code: 'SERVER', message: '502' }, signal)
+      await Promise.resolve()
+      mock.timers.tick(200)
+      assert.deepEqual(await firstStep, { kind: 'retry' })
+
+      // 同回合的新 step 首次重试：预算跨 step 共享（已用 1/2），但链内序号必须从 1 开始——
+      // v0.3.0 在此处写出 retry=2，链首跳号导致整份会话无法加载
+      const secondStep = sendSupplementalFailure(fixture, agent, { turn: 1, step: 2, code: 'SERVER', message: '502' }, signal)
+      await Promise.resolve()
+      mock.timers.tick(200)
+      assert.deepEqual(await secondStep, { kind: 'retry' })
+
+      const retries = agent.events.filter((event) => event.type === 'llm/retry')
+      assert.equal(retries.length, 2)
+      assert.deepEqual(retries.map((event) => event.data.retry), [1, 1])
+      assert.notEqual(retries[0].data.retryId, retries[1].data.retryId)
+      assertRetryChainInvariants(agent)
+    } finally {
+      await fixture.dispose()
+    }
+  })
+})
+
+test('policy chain capacity stops retries when failure codes rotate within one step', { concurrency: false }, async () => {
+  await withFakeTimers(async () => {
+    const fixture = createFixture({
+      rules: [
+        { code: 'SERVER', enabled: true, maxRetries: 1 },
+        { code: 'TIMEOUT', enabled: true, maxRetries: 1 },
+      ],
+    })
+    try {
+      const agent = createAgent('session-abcdef12-rotate', {}, fixture.eventStore)
+      const signal = new AbortController().signal
+
+      const serverFailure = sendSupplementalFailure(fixture, agent, { turn: 1, step: 1, code: 'SERVER', message: '502' }, signal)
+      await Promise.resolve()
+      mock.timers.tick(200)
+      assert.deepEqual(await serverFailure, { kind: 'retry' })
+
+      // 重发后错误码轮换（502 重试后超时）：TIMEOUT 预算未尽，但链内序号将到 2，
+      // 超过 maxRetries=1 会被加载器拒绝——链容量闸门必须放行终局而不是写超额事件
+      const timeoutFailure = sendSupplementalFailure(fixture, agent, { turn: 1, step: 1, code: 'TIMEOUT', message: 'timed out' }, signal)
+      await Promise.resolve()
+      mock.timers.tick(200)
+      assert.equal(await timeoutFailure, undefined)
+
+      const retries = agent.events.filter((event) => event.type === 'llm/retry')
+      assert.equal(retries.length, 1)
+      assert.equal(retries[0].data.retry, 1)
+      assertRetryChainInvariants(agent)
+    } finally {
+      await fixture.dispose()
+    }
+  })
+})
+
+test('a cancelled supplemental retry keeps its chain attempt for the next retry', { concurrency: false }, async () => {
+  await withFakeTimers(async () => {
+    const fixture = createFixture({
+      rules: [{ code: 'SERVER', enabled: true, maxRetries: 2 }],
+    })
+    try {
+      const agent = createAgent('session-abcdef12-cancel', {}, fixture.eventStore)
+      const controller = new AbortController()
+
+      const cancelled = sendSupplementalFailure(fixture, agent, { turn: 1, step: 1, code: 'SERVER', message: '502' }, controller.signal)
+      await Promise.resolve()
+      controller.abort()
+      assert.equal(await cancelled, undefined)
+
+      // 排程事件已入会话历史，链内序号已消耗且必须保持连续——下一次重试接着写 retry=2
+      const retried = sendSupplementalFailure(fixture, agent, { turn: 1, step: 1, code: 'SERVER', message: '502' }, new AbortController().signal)
+      await Promise.resolve()
+      mock.timers.tick(200)
+      assert.deepEqual(await retried, { kind: 'retry' })
+
+      const retries = agent.events.filter((event) => event.type === 'llm/retry')
+      assert.deepEqual(retries.map((event) => event.data.retry), [1, 2])
+      assert.equal(retries[0].data.retryId, retries[1].data.retryId)
+      assertRetryChainInvariants(agent)
+    } finally {
+      await fixture.dispose()
+    }
+  })
+})
+
 test('new user input cancels a pending automatic continuation', { concurrency: false }, async () => {
   await withFakeTimers(async () => {
     const fixture = createFixture({ mainAgent: { continueDelayMs: 100 } })

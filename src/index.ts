@@ -218,7 +218,9 @@ export function apply(ctx: any, config: unknown): void {
 
   /* ---------- 运行时状态 ---------- */
 
-  // 请求级补充重试计数桶：sessionId → turn → ruleCode → 已重试次数
+  // 请求级补充重试计数桶：sessionId → turn → 桶内计数。
+  // 桶内键有两类：错误码（值 = 该码已用预算，跨 step 共享）与
+  // "chain:step:provider"（值 = 该策略链内已消耗的重试序号，供 llm/retry 事件连续计数）
   const retryBuckets = new Map<string, Map<number, Map<string, number>>>()
   // 自动继续熔断计数：sessionId → 连续终局失败次数（回合 completed 清零）
   const continueStreaks = new Map<string, number>()
@@ -441,7 +443,9 @@ export function apply(ctx: any, config: unknown): void {
     }
     let bucket: Map<string, number> | undefined
     let bucketRule: string | undefined
+    let chainKey: string | undefined
     let used = 0
+    let scheduled = false
     let retryCommitted = false
     try {
       const conf = cfg()
@@ -461,19 +465,28 @@ export function apply(ctx: any, config: unknown): void {
       const scopeOn = sub ? conf.subAgent.requestRetry : conf.mainAgent.requestRetry
       if (!scopeOn) return delegate()
 
-      // 计数桶：同一 (会话, 回合, 规则) 共享一个预算
+      // 计数桶：同一 (会话, 回合) 共享一个桶。桶内记两类数：
+      //   - 预算 used：按错误码（跨 step 共享），用于 maxRetries 判定与指数退避；
+      //   - 链内序号 attempt：按策略链（turn + step + provider，policyKey 恒定），从 1 连续递增。
+      // DSH 会话加载器对 llm/retry 的不变量：同链 retryId 恒定、链内 retry 从 1 连续递增
+      // 且不得超过 maxRetries、retryId 不得跨链重复。预算与链序号因此必须分开计数。
       const sessionId = payload.agent.session.id
       const turns = retryBuckets.get(sessionId) ?? new Map<number, Map<string, number>>()
       retryBuckets.set(sessionId, turns)
       bucket = turns.get(payload.turn) ?? new Map<string, number>()
       turns.set(payload.turn, bucket)
       bucketRule = rule.code
+      chainKey = `chain:${payload.step}:${payload.provider}`
       used = bucket.get(rule.code) ?? 0
-      if (used >= rule.maxRetries) {
-        log.info('补充重试预算已用尽（%s 第 %d 次），放行终局', code, used)
+      const attempt = (bucket.get(chainKey) ?? 0) + 1
+      if (used >= rule.maxRetries || attempt > rule.maxRetries) {
+        // 预算尽（跨 step 共享）或链内连续重试已达上限（同 step 换错误码会累计）→ 放行终局。
+        // 链容量闸门保证 durable 事件 retry ≤ maxRetries，否则加载器拒绝整份会话历史。
+        log.info('补充重试不再继续（%s 预算已用 %d 次，链内将第 %d 次），放行终局', code, used, attempt)
         return delegate()
       }
       bucket.set(rule.code, used + 1)
+      bucket.set(chainKey, attempt)
 
       // 重试间隔：上游 Retry-After 优先；否则按配置的模式——指数退避或固定间隔（均加 ±10% 抖动）
       const backoff = conf.backoff
@@ -484,8 +497,12 @@ export function apply(ctx: any, config: unknown): void {
           : Math.min(backoff.initialDelayMs * 2 ** used, backoff.maxDelayMs)
       const delayMs = Math.round(base * (0.9 + Math.random() * 0.2))
 
-      const retryId = `auto-${sessionId.slice(0, 8)}-${payload.turn}-${payload.step}-${code}-${used + 1}`
-      // 先写 durable 重试排程事件（与内置 llm/retry 事件同形，会话日志可审计）
+      // retryId 在链内恒定、跨链不重复：turn + step + provider 已唯一定位一条链
+      // （policyKey 恒为 'auto-retry'），因此 id 中不得再掺入会自增的计数。
+      // 会话 id 取前 16 位（越过恒定的 "session-" 前缀，保留有效区分字符）。
+      const retryId = `auto-${sessionId.slice(0, 16)}-${payload.turn}-${payload.step}-${payload.provider}`
+      // 先写 durable 重试排程事件（与内置 llm/retry 事件同形，会话日志可审计）；
+      // retry 必须是链内序号 attempt，不能复用跨 step/跨码共享的预算计数
       payload.agent.session.append('llm/retry', {
         retryId,
         turn: payload.turn,
@@ -493,12 +510,13 @@ export function apply(ctx: any, config: unknown): void {
         provider: payload.provider,
         mode: 'normal',
         policyKey: 'auto-retry',
-        retry: used + 1,
+        retry: attempt,
         maxRetries: rule.maxRetries,
         delayMs,
         failure,
       })
-      log.info('计划补充重试：%s（%d/%d），%d ms 后重发', code, used + 1, rule.maxRetries, delayMs)
+      scheduled = true
+      log.info('计划补充重试：%s（链内第 %d 次，%s 预算已用 %d/%d），%d ms 后重发', code, attempt, rule.code, used + 1, rule.maxRetries, delayMs)
 
       // 等待期间被取消 → 放弃接管，失败走终局（可能由自动继续层接手）
       if (!await cancellableDelay(delayMs, payload.signal, lifetime.signal)) {
@@ -510,15 +528,19 @@ export function apply(ctx: any, config: unknown): void {
         retryId,
         turn: payload.turn,
         step: payload.step,
-        retry: used + 1,
+        retry: attempt,
       })
       // 接管：让 agent loop 在当前回合内重发请求
       retryCommitted = true
       return { kind: 'retry' }
     } catch (error) {
-      // 监听器自身异常不允许破坏请求失败路径；发生在排程之后时回滚预算。
+      // 监听器自身异常不允许破坏请求失败路径；发生在排程之前时回滚预算与链序号。
+      // 排程事件已写入会话历史后（scheduled），链内序号已实际消耗且必须保持连续，不可回滚。
       if (delegated) throw error
-      if (!retryCommitted && bucket && bucketRule !== undefined) bucket.set(bucketRule, used)
+      if (!retryCommitted && bucket && bucketRule !== undefined) {
+        bucket.set(bucketRule, used)
+        if (!scheduled && chainKey !== undefined) bucket.delete(chainKey)
+      }
       if (abandoned) return undefined
       log.warn('补充重试监听器异常：%o', error)
       return delegate()
